@@ -1,0 +1,24 @@
+# Ignore CZI processing outputs and uploads directories
+czi_process/output_project/
+czi_process/uploads/
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env*.zip
+
+*.czi
+
+*_mask.png
+*_c0.png
+*_c1.png
+*_c2.png
+*_c3.png
+*_c4.png
+*_c5.png
+*_c6.png
+
+*.npy

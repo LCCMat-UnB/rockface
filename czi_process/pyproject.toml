@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rockface"
+version = "0.1.0"
+description = "Petrographic thin-section CZI processing toolkit (LCCMat / Petrobras): patching and pore-mask generation for Zeiss CZI microscope slides."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [
+    { name = "LCCMat / Petrobras" },
+]
+dependencies = [
+    "aicspylibczi",
+    "numpy",
+    "opencv-python",
+    "Pillow",
+]
+
+[project.scripts]
+rockface = "rockface.pipeline:cli_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rockface"]

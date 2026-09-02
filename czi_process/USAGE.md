@@ -18,6 +18,15 @@ Opening a `CZI` computes a stable slide ID (`czi.id`), creates
 overview (bounding box, pixel scale, available channels) into
 `czi.overview`.
 
+**Channels and masking, in one sentence:** each polarization channel
+(typically `0` through `6`) is extracted and saved as its own raw
+image -- `patch_y{y}_x{x}_pol{c}.*` -- with no synthesized composite.
+Channel `0` is the slide's own unpolarized ("normal") view. Pore masks
+are always segmented from channel `0` only (`Mask.run`'s
+`source_channel=0` by default) -- masking a polarized channel
+(`channel != 0`) is not a supported use case, since pore contrast
+against the resin is only reliable under unpolarized light.
+
 ---
 
 ## 1. Run a single patch and its mask
@@ -26,33 +35,20 @@ Useful for testing the pipeline on one region before committing to a
 full slide, or for debugging a specific coordinate.
 
 ```python
-# Extract one patch at (y=0, x=0)
+# Extract one patch at (y=0, x=0) -- every available channel, each its own file
 result = czi.patching.process_single_patch(
     coord=(0, 0),
     patch_size=4096,
     formats=["npy", "png"],
 )
-print(result)  # {"status": "ok", "channels": [...], "normal_is_redundant": False}
+print(result)  # {"status": "ok", "channels": [0, 1, 2, 3, 4, 5]}
 
-# Generate its mask
+# Generate its mask, from channel 0 (the slide's unpolarized view)
 mask_ok = czi.mask.process_patch(
-    source_npy_path=czi.output_dir / "patches" / "patch_y0_x0_normal.npy",
+    source_npy_path=czi.output_dir / "patches" / "patch_y0_x0_pol0.npy",
     mask_dir=czi.output_dir / "masks",
     formats=["npy", "png"],
 )
-```
-
-**Note:** if the slide (or this run) only has one polarization
-channel available, no separate `patch_y0_x0_normal.npy` is written --
-see [Section 6](#6-why-does-a-patch-sometimes-have-no-normal-file).
-Use `rockface.patching.find_normal_source(patch_dir, y, x)` to resolve
-the right source file instead of hardcoding the `_normal` filename:
-
-```python
-from rockface.patching import find_normal_source
-
-source = find_normal_source(czi.output_dir / "patches", 0, 0)
-mask_ok = czi.mask.process_patch(source, czi.output_dir / "masks", formats=["npy", "png"])
 ```
 
 ### Single patch with its mask overlaid on top
@@ -63,8 +59,8 @@ separate files:
 ```python
 import numpy as np
 
-normal_array = np.load(source)  # or czi.output_dir / "patches" / "patch_y0_x0_normal.npy"
-overlaid = czi.mask.overlay_on_patch(normal_array, pixel_format=czi._pixel_format())
+channel0_array = np.load(czi.output_dir / "patches" / "patch_y0_x0_pol0.npy")
+overlaid = czi.mask.overlay_on_patch(channel0_array, pixel_format=czi._pixel_format())
 
 from PIL import Image
 czi.save_image(Image.fromarray(overlaid), czi.output_dir / "patches" / "patch_y0_x0_overlay.png")
@@ -73,8 +69,8 @@ czi.save_image(Image.fromarray(overlaid), czi.output_dir / "patches" / "patch_y0
 Pass a mask you already computed to avoid re-segmenting:
 
 ```python
-mask = czi.mask.generate_pore_mask(normal_array)  # expects BGR input
-overlaid = czi.mask.overlay_on_patch(normal_array, mask=mask, filled_mode=True)
+mask = czi.mask.generate_pore_mask(channel0_array)  # expects BGR input
+overlaid = czi.mask.overlay_on_patch(channel0_array, mask=mask, filled_mode=True)
 ```
 
 ---
@@ -87,10 +83,10 @@ The full pipeline, run stage by stage:
 czi.save_metadata()
 
 coords = czi.patching.get_patches(patch_size=4096, stride=3800)
-czi.save_patching_data(coords, patch_size=4096, stride=3800, full_grid_total=len(coords))
+czi.save_patching_data(coords, patch_size=4096, stride=3800)
 
 czi.patching.run(patch_size=4096, stride=3800, formats=["npy", "png"], verbose=True)
-czi.mask.run(formats=["npy", "png"], verbose=True)
+czi.mask.run(formats=["npy", "png"], verbose=True)  # source_channel=0 by default
 ```
 
 Or the same thing in one call:
@@ -108,10 +104,9 @@ summary = czi.run(
 Both `Patching.run()` and `Mask.run()` parallelize internally with
 `multiprocessing.Pool` -- "patching and masking in parallel" in the
 sense of each stage being internally parallel across patches. Masking
-always depends on patches already existing on disk, so the two stages
-themselves run one after the other (mask generation reads each
-patch's saved `_normal`/`_pol{c}` file) -- `czi.run()` sequences them
-correctly for you.
+always depends on patches already existing on disk (specifically, each
+patch's `_pol0.npy`/`.npz` file), so the two stages themselves run one
+after the other -- `czi.run()` sequences them correctly for you.
 
 To control how many worker processes are used, either pass
 `max_workers=` to a specific call, or set it once for the whole
@@ -134,7 +129,7 @@ slide -- does not require patching to have run.
 
 ## 4. Generate the manifest
 
-The manifest lists every patch that has both a normal image and a
+The manifest lists every patch that has both a channel-0 image and a
 mask, with relative (or absolute) file paths -- typically consumed by
 a viewer or a downstream ML dataset step.
 
@@ -162,8 +157,8 @@ stride` windows per patch (no double-counted overlap at patch seams).
 ### Slide alone (any channel)
 
 ```python
-normal_mosaic = czi.patching.restitch(stride=3800, channel="normal")
-pol0_mosaic = czi.patching.restitch(stride=3800, channel="pol0")
+channel0_mosaic = czi.patching.restitch(stride=3800)              # channel="pol0" by default
+pol3_mosaic = czi.patching.restitch(stride=3800, channel="pol3")
 ```
 
 Requires patches to have been saved with `formats` including `"npy"`
@@ -207,41 +202,46 @@ below.)
 ### Slide + mask, overlaid together
 
 ```python
-overlaid = czi.patching.restitch_with_mask_overlay(stride=3800)
+overlaid = czi.patching.restitch_with_mask_overlay(stride=3800)  # source_channel=0 by default
 
 from PIL import Image
 czi.save_image(Image.fromarray(overlaid), czi.output_dir / "mosaic_with_mask.png")
 ```
 
-Requires both the normal patches (`npy`/`npz`) and the masks
+Requires both the channel-0 patches (`npy`/`npz`) and the masks
 (`npy`/`npz`, from `czi.mask.run(formats=[...])`) to already be on
 disk. Defaults to a **filled** overlay (`filled_mode=True`) rather
 than contours-only, since solid fill reads more clearly at full-slide
 scale; pass `filled_mode=False` for contours instead.
 
 **Memory note:** restitching a full slide loads the whole mosaic into
-RAM -- `restitch_with_mask_overlay` holds two full mosaics (normal +
+RAM -- `restitch_with_mask_overlay` holds two full mosaics (channel-0 +
 mask) plus the composited result at once. For very large slides,
 restitch one region/channel at a time instead of the whole thing.
 
 ---
 
-## 6. Why does a patch sometimes have no `_normal` file?
+## 6. Channels, and why masking is always channel 0
 
-If a slide (or a given run's `polarization_channels`) has only **one**
-polarization channel, synthesizing a "normal" composite from it is a
-no-op -- the mean/max of one array is that same array. In that case,
-`Patching.run()` no longer writes a redundant `_normal` file that
-would just be a byte-for-byte copy of `_pol{c}`; the per-patch result
-dict reports this via `"normal_is_redundant": True`.
+Every polarization channel available on the slide (typically `0`
+through `6`) is extracted and saved as its own raw image --
+`patch_y{y}_x{x}_pol{c}.*` -- during `Patching.run()`. No composite
+"normal" image is synthesized or saved: channel `0` **is** the
+slide's own unpolarized/normal view, so there was never a separate
+thing to synthesize.
 
-Every RockFace method that reads a patch's "normal" image (`Mask.run`,
-`Mask.process_patch`, `Patching.restitch(channel="normal")`,
-`restitch_with_mask_overlay`) already knows how to fall back to that
-single `_pol{c}` file automatically -- you never need to special-case
-this yourself. If you're calling into patch files directly, use
-`rockface.patching.find_normal_source(patch_dir, y, x)` rather than
-assuming `patch_y{y}_x{x}_normal.npy` always exists.
+Pore masks are always segmented from channel `0` -- this is a fixed
+rule of the domain (pore contrast against the resin is only reliable
+under unpolarized light), not a configurable choice meant for regular
+use. `Mask.run()`/`Mask.process_patch()` accept a `source_channel`
+parameter, but it exists only for the rare case where a slide's own
+unpolarized channel is genuinely indexed differently from `0` --
+never to mask a polarized channel (`channel != 0`) for its own sake.
+
+If you're working with patch files directly, use
+`rockface.patching.find_channel_source(patch_dir, y, x, channel)` to
+resolve a specific channel's file for a coordinate, rather than
+constructing the filename by hand.
 
 ---
 
@@ -279,8 +279,8 @@ Most of the above is also available via the `rockface` command
 # Full pipeline, whole slide
 rockface sample.czi --output ./output_project --patch-size 4096 --stride 3800 --verbose
 
-# Restitch the normal mosaic afterwards
-rockface sample.czi --restitch normal
+# Restitch the channel-0 mosaic afterwards
+rockface sample.czi --restitch pol0
 
 # Only a specific set of coordinates (patching + masking both restricted to these)
 rockface sample.czi --coords-file coords.json
@@ -297,6 +297,6 @@ Where `coords.json` is a JSON list of `[y, x]` pairs:
 
 The CLI does not expose `restitch_with_mask_overlay` or
 `overlay_on_patch` directly (both are compositing conveniences meant
-for interactive/API use) -- run `--restitch normal`, then call
+for interactive/API use) -- run `--restitch pol0`, then call
 `czi.patching.restitch_with_mask_overlay(...)` from Python against the
 same `--output` directory.

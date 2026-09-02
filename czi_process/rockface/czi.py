@@ -8,8 +8,11 @@ Opening a :class:`CZI` resolves a stable slide identity, opens the file,
 and reads its physical/structural overview (bounding box, pixel scale,
 available polarization channels). It also carries the low-level image
 I/O and color-space helpers shared by patch extraction and mask
-generation: atomic file writes (.npy/.npz/.png/.jpg), color-order
-conversion, and multi-polarization synthesis.
+generation: atomic file writes (.npy/.npz/.png/.jpg) and color-order
+conversion. Each polarization channel is extracted and saved as its
+own raw image -- channel 0 is the slide's own unpolarized/normal view,
+used directly for masking (see rockface.masks.Mask); no synthesized
+composite image is produced.
 
 Module-level functions vs. instance methods
 ---------------------------------------------
@@ -237,40 +240,6 @@ def convert_array_to_rgb(array: np.ndarray, pixel_format: str = "unknown") -> np
     if array_rgb.dtype != np.uint8:
         array_rgb = np.clip(array_rgb, 0, 255).astype(np.uint8, copy=False)
     return array_rgb
-
-
-def synthesize_channel_stack(polarized_stack: List[np.ndarray], mode: str = "mean") -> np.ndarray:
-    """Combine a stack of polarization channels into one composite image.
-
-    In polarized-light microscopy, combining several polarizer
-    rotations approximates an unpolarized ("normal") view of the thin
-    section.
-
-    Args:
-        polarized_stack: A list of same-shape arrays, one per
-            polarization channel.
-        mode: Combination strategy -- ``"mean"`` (per-pixel average,
-            default) or ``"max"`` (per-pixel maximum, emphasizing
-            bright responses).
-
-    Returns:
-        A ``uint8`` array in the same channel order as the input
-        (typically BGR, matching the raw CZI read).
-
-    Raises:
-        ValueError: If ``polarized_stack`` is empty, or its arrays do
-            not all share the same shape.
-    """
-    if not polarized_stack:
-        raise ValueError("polarized_stack is empty -- nothing to synthesize.")
-
-    base_shape = polarized_stack[0].shape
-    if any(layer.shape != base_shape for layer in polarized_stack):
-        raise ValueError("All polarization channels must share the same shape.")
-
-    stack = np.stack([layer.astype(np.float32) for layer in polarized_stack], axis=0)
-    combined = stack.max(axis=0) if mode == "max" else stack.mean(axis=0)
-    return np.clip(combined, 0, 255).astype(np.uint8)
 
 
 def _atomic_write(output_path: Union[str, Path], write_fn: Callable[[Path], None]) -> Path:
@@ -550,7 +519,6 @@ class CZI:
         patch_size: int,
         stride: int,
         polarization_channels: Optional[List[int]] = None,
-        normal_mode: str = "mean",
         full_grid_total: Optional[int] = None,
     ) -> Path:
         """Save this patching run's parameters as JSON.
@@ -570,9 +538,11 @@ class CZI:
             patch_size: Patch side length, in pixels.
             stride: Step between patches, in pixels.
             polarization_channels: Channel indices used for this run,
-                recorded for reference.
-            normal_mode: How the "normal" (unpolarized composite) image
-                was synthesized for this run -- ``"mean"`` or ``"max"``.
+                recorded for reference. Each is saved as its own raw
+                channel image (``patch_y{y}_x{x}_pol{c}.*``) -- no
+                composite "normal" image is synthesized; channel ``0``
+                is the slide's own unpolarized/normal view (see
+                :meth:`rockface.masks.Mask.run`'s ``source_channel``).
             full_grid_total: The size of the slide's full patch grid at
                 this ``patch_size``/``stride`` (i.e.
                 ``len(Patching.get_patches(patch_size, stride))``), when
@@ -603,7 +573,6 @@ class CZI:
             "polarization": {
                 "channels": channels,
                 "count": len(channels),
-                "normal_mode": normal_mode,
             },
         }
 
@@ -714,28 +683,6 @@ class CZI:
             ``PIL.Image.fromarray``.
         """
         return convert_array_to_rgb(array, pixel_format=self._pixel_format())
-
-    def synthesize_channels(self, polarized_stack: List[np.ndarray], mode: str = "mean") -> np.ndarray:
-        """Combine a stack of polarization channels into one composite image.
-
-        Formerly ``synthesize_normal_image`` in ``image_functions.py``.
-
-        Args:
-            polarized_stack: A list of same-shape arrays, one per
-                polarization channel.
-            mode: Combination strategy -- ``"mean"`` (per-pixel average,
-                default) or ``"max"`` (per-pixel maximum, emphasizing
-                bright responses).
-
-        Returns:
-            A ``uint8`` array in the same channel order as the input
-            (typically BGR, matching the raw CZI read).
-
-        Raises:
-            ValueError: If ``polarized_stack`` is empty, or its arrays
-                do not all share the same shape.
-        """
-        return synthesize_channel_stack(polarized_stack, mode=mode)
 
     # ------------------------------------------------------------
     # PIPELINE CONVENIENCE

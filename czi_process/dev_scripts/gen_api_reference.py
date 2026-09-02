@@ -104,9 +104,9 @@ h(3, "`rockface.config.resolve_max_workers`")
 sig_block(config_mod.resolve_max_workers)
 doc_block(config_mod.resolve_max_workers)
 
-h(3, "`rockface.patching.find_normal_source`")
-sig_block(patching_mod.find_normal_source)
-doc_block(patching_mod.find_normal_source)
+h(3, "`rockface.patching.find_channel_source`")
+sig_block(patching_mod.find_channel_source)
+doc_block(patching_mod.find_channel_source)
 
 h(2, "Command-line interface")
 lines.append("```console\n$ rockface --help\n")

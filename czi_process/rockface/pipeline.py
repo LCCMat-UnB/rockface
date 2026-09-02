@@ -34,7 +34,7 @@ def run_pipeline(
     patch_size: int = 4096,
     stride: int = 3800,
     polarization_channels: Optional[List[int]] = None,
-    normal_mode: str = "mean",
+    mask_source_channel: int = 0,
     patch_formats: Optional[List[str]] = None,
     mask_formats: Optional[List[str]] = None,
     max_workers: Optional[int] = None,
@@ -50,15 +50,18 @@ def run_pipeline(
         1. Save image metadata (``CZI.save_metadata``).
         2. Compute the patch grid and save patching metadata
            (``Patching.get_patches``, ``CZI.save_patching_data``).
-        3. Extract patches: every polarization channel plus the
-           synthesized normal image, for either the full grid or an
-           explicit ``coords`` subset (``Patching.run``). Saving each
-           patch happens as an inherent part of this stage -- there is
-           no separate "save patching" step in this pipeline.
-        4. Generate a pore mask for every patch just extracted
-           (``Mask.run``) -- the same ``coords`` subset is passed
-           through, so a partial run masks exactly what it patched,
-           not whatever else happens to already be on disk.
+        3. Extract patches: every requested polarization channel, as
+           its own raw image, for either the full grid or an explicit
+           ``coords`` subset (``Patching.run``). No composite "normal"
+           image is synthesized -- channel 0 is the slide's own
+           unpolarized/normal view. Saving each patch happens as an
+           inherent part of this stage -- there is no separate "save
+           patching" step in this pipeline.
+        4. Generate a pore mask for every patch just extracted, from
+           ``mask_source_channel`` only (``Mask.run``) -- the same
+           ``coords`` subset is passed through, so a partial run masks
+           exactly what it patched, not whatever else happens to
+           already be on disk.
         5. Optionally reassemble ("restitch") patches into full
            mosaics, one per requested channel, and save each mosaic as
            ``.npy`` + ``.png`` (``Patching.restitch``).
@@ -74,8 +77,14 @@ def run_pipeline(
         patch_size: Patch side length, in pixels.
         stride: Step between patches, in pixels.
         polarization_channels: Channels to extract. Defaults to every
-            channel available on the slide.
-        normal_mode: ``"mean"`` or ``"max"``.
+            channel available on the slide (typically ``0`` through
+            ``6``). Each is saved as its own raw image -- no composite
+            is synthesized.
+        mask_source_channel: Which polarization channel to segment
+            masks from, relayed to ``Mask.run(source_channel=...)``.
+            Defaults to ``0``, the slide's own unpolarized/normal view
+            -- a fixed rule of the segmentation method, not a free
+            choice (see ``Mask.run``'s docstring).
         patch_formats: File formats to save per patch, relayed to
             ``Patching.run(formats=...)``. Any subset of
             ``{"npy", "npz", "png", "jpg"}``; defaults to
@@ -99,7 +108,7 @@ def run_pipeline(
             ``Mask.run`` to print rate-limited percentage progress to
             stderr, plus a short header line before each stage.
         restitch_channels: Channel names to restitch into full mosaics,
-            e.g. ``["normal"]`` or ``["normal", "pol0"]``. ``None``
+            e.g. ``["pol0"]`` or ``["pol0", "pol3"]``. ``None``
             (default) skips restitching -- full mosaics can be large,
             so this is opt-in. If ``coords`` was a partial subset, the
             resulting mosaic will have gaps -- see
@@ -163,7 +172,6 @@ def run_pipeline(
         patch_size=patch_size,
         stride=stride,
         polarization_channels=channels,
-        normal_mode=normal_mode,
         full_grid_total=len(full_grid),
     )
 
@@ -178,7 +186,6 @@ def run_pipeline(
         patch_size=patch_size,
         stride=stride,
         polarization_channels=channels,
-        normal_mode=normal_mode,
         formats=patch_formats,
         max_workers=max_workers,
         on_progress=on_progress,
@@ -191,6 +198,7 @@ def run_pipeline(
     # --- Stage 4: generate masks (parallel), same coords subset as patching ---
     summary["masking"] = czi.mask.run(
         coords=active_coords,
+        source_channel=mask_source_channel,
         formats=mask_formats,
         max_workers=max_workers,
         on_progress=on_progress,
@@ -330,8 +338,11 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         help="Step between patches, in pixels (default: 3800).",
     )
     parser.add_argument(
-        "--normal-mode", choices=["mean", "max"], default="mean",
-        help="Normal-image synthesis mode (default: mean).",
+        "--mask-source-channel", type=int, default=0,
+        help="Polarization channel to segment pore masks from (default: 0, "
+             "the slide's own unpolarized/normal view). Fixed rule of the "
+             "segmentation method -- change only if your slide's unpolarized "
+             "channel is genuinely indexed differently.",
     )
     parser.add_argument(
         "--max-workers", type=int, default=None,
@@ -340,7 +351,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--restitch", type=str, default=None,
         help="Comma-separated channel names to restitch into full mosaics, "
-             "e.g. 'normal' or 'normal,pol0'. Omit to skip restitching.",
+             "e.g. 'pol0' or 'pol0,pol3'. Omit to skip restitching.",
     )
     parser.add_argument(
         "--coords-file", type=str, default=None,
@@ -393,7 +404,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         coords=coords,
         patch_size=args.patch_size,
         stride=args.stride,
-        normal_mode=args.normal_mode,
+        mask_source_channel=args.mask_source_channel,
         patch_formats=patch_formats,
         mask_formats=mask_formats,
         max_workers=args.max_workers,

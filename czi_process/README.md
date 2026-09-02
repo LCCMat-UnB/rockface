@@ -22,13 +22,12 @@ czi.save_metadata()
 
 coords = czi.patching.get_patches(patch_size=4096, stride=3800)
 czi.save_patching_data(coords, patch_size=4096, stride=3800,
-                        polarization_channels=czi.overview["channels"],
-                        normal_mode="mean")
+                        polarization_channels=czi.overview["channels"])
 
-czi.patching.run(patch_size=4096, stride=3800)
-czi.mask.run()
+czi.patching.run(patch_size=4096, stride=3800)  # every channel, each its own raw image
+czi.mask.run()  # masks generated from channel 0 (the slide's unpolarized view)
 
-mosaic = czi.patching.restitch(stride=3800)
+mosaic = czi.patching.restitch(stride=3800)  # channel="pol0" by default
 czi.patching.generate_manifest(
     patch_dir=czi.output_dir / "patches",
     mask_dir=czi.output_dir / "masks",
@@ -51,8 +50,11 @@ Both `czi.patching.run()` and `czi.mask.run()` accept an optional `coords`
 list of `(y, x)` pairs, instead of always processing the full grid — useful
 for a region of interest, re-running only a few failed patches, or a quick
 trial before committing to the whole slide. Masking always operates "per
-patch" (it needs a patch's extracted normal image to exist first); it never
-processes the whole slide as a single unit.
+patch" (it needs a patch's extracted channel-0 image to exist first) and
+only ever from channel 0 (`source_channel=0` by default — see
+[USAGE.md §6](./USAGE.md#6-channels-and-why-masking-is-always-channel-0)); it
+never processes the whole slide as a single unit, and never masks a
+polarized channel.
 
 ```python
 coords = [(0, 0), (0, 3800), (3800, 0)]
@@ -60,7 +62,7 @@ coords = [(0, 0), (0, 3800), (3800, 0)]
 czi.patching.run(coords=coords, patch_size=4096, stride=3800)
 czi.mask.run(coords=coords)          # masks exactly those 3 patches
 
-# czi.mask.run() with no coords processes every *_normal.npy already on disk
+# czi.mask.run() with no coords processes every *_pol0.npy already on disk
 czi.mask.run()
 ```
 
@@ -144,25 +146,26 @@ slide reconstruction composited with the full mask reconstruction.
 ```python
 # (a) One patch, mask drawn on top
 import numpy as np
-normal_array = np.load(czi.output_dir / "patches" / "patch_y0_x0_normal.npy")
-overlaid_patch = czi.mask.overlay_on_patch(normal_array, pixel_format=czi._pixel_format())
+channel0_array = np.load(czi.output_dir / "patches" / "patch_y0_x0_pol0.npy")
+overlaid_patch = czi.mask.overlay_on_patch(channel0_array, pixel_format=czi._pixel_format())
 
 # (b) Whole slide, mask reconstruction drawn on top
-overlaid_slide = czi.patching.restitch_with_mask_overlay(stride=3800)
+overlaid_slide = czi.patching.restitch_with_mask_overlay(stride=3800)  # source_channel=0 by default
 ```
 
 See [`USAGE.md`](./USAGE.md) for the full set of task-oriented recipes
 (single patch + mask, parallel patching/masking, metadata, manifest,
 and all three restitch variants).
 
-### Note: "normal" and a single polarization channel
+### Note: channels and masking
 
-If a slide/run has only one polarization channel, its synthesized
-"normal" composite would be identical to that channel — RockFace
-detects this and skips writing the redundant `_normal` file. Every
-method that reads a patch's normal image already falls back to that
-single channel's file automatically; see
-[USAGE.md §6](./USAGE.md#6-why-does-a-patch-sometimes-have-no-normal-file)
+Every polarization channel (typically `0`-`6`) is extracted and saved
+as its own raw image (`patch_y{y}_x{x}_pol{c}.*`) — no composite
+"normal" image is synthesized. Channel `0` **is** the slide's own
+unpolarized/normal view, and pore masks are always segmented from it
+alone (never from a polarized channel) — a fixed rule of the
+segmentation method, not a configurable choice for regular use. See
+[USAGE.md §6](./USAGE.md#6-channels-and-why-masking-is-always-channel-0)
 for details.
 
 ## Terminal usage

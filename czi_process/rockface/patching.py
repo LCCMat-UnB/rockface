@@ -9,8 +9,9 @@ Responsibilities:
     called once by :class:`~rockface.czi.CZI` at construction time).
   * Compute a deterministic patch grid (:meth:`Patching.get_patches`).
   * Extract, for every patch coordinate, **every polarization channel**
-    plus the synthesized "normal" composite image, in parallel
-    (:meth:`Patching.run`).
+    (typically 0-6) as its own raw image, in parallel
+    (:meth:`Patching.run`). Channel 0 is the slide's own
+    unpolarized/"normal" view -- no composite image is synthesized.
   * Reassemble extracted patches back into a full-resolution mosaic
     (:meth:`Patching.restitch`).
   * Describe a patching run for downstream consumers
@@ -72,44 +73,32 @@ def _load_patch_array(path: Path) -> np.ndarray:
     return data
 
 
-def find_normal_source(patch_dir: Union[str, Path], y: int, x: int) -> Optional[Path]:
-    """Locate the "normal" composite file for one patch coordinate, with fallback.
+def find_channel_source(patch_dir: Union[str, Path], y: int, x: int, channel: int) -> Optional[Path]:
+    """Locate one patch coordinate's raw file for a specific polarization channel.
 
     Module-level: shared by :meth:`Mask.run`/:meth:`Mask.process_patch`
-    (via :mod:`rockface.masks`) and :meth:`Patching.restitch`.
-
-    Looks for ``patch_y{y}_x{x}_normal.npy`` (or ``.npz``) first. When a
-    patch was extracted with only one polarization channel available,
-    :func:`_process_single_patch_worker` deliberately does not write a
-    ``_normal`` file -- synthesizing one from a single channel would
-    just be a byte-for-byte duplicate of that channel's own file (this
-    is what previously made "normal" and "channel 0" look identical).
-    In that case, this falls back to that patch's single
-    ``patch_y{y}_x{x}_pol{c}.npy``/``.npz`` file instead, since it
-    represents the same thing the normal composite would have.
+    (via :mod:`rockface.masks`) and
+    :meth:`Patching.restitch_with_mask_overlay`, to resolve
+    ``patch_y{y}_x{x}_pol{channel}.npy``/``.npz`` -- typically channel
+    ``0``, the slide's own unpolarized/normal view (see this module's
+    docstring).
 
     Args:
         patch_dir: Directory containing extracted patch files.
         y: Patch row coordinate (as encoded in the filename).
         x: Patch column coordinate (as encoded in the filename).
+        channel: Polarization channel index, e.g. ``0``.
 
     Returns:
-        Path to the file to treat as this patch's normal composite
-        (preferring ``.npy`` over ``.npz`` when both exist), or
-        ``None`` if neither a ``_normal`` file nor exactly one
-        ``_pol{c}`` file is found.
+        Path to ``patch_y{y}_x{x}_pol{channel}.npy`` if it exists,
+        else ``patch_y{y}_x{x}_pol{channel}.npz`` if that exists
+        instead, else ``None``.
     """
     patch_dir = Path(patch_dir)
     for suffix in ("npy", "npz"):
-        candidate = patch_dir / f"patch_y{y}_x{x}_normal.{suffix}"
+        candidate = patch_dir / f"patch_y{y}_x{x}_pol{channel}.{suffix}"
         if candidate.exists():
             return candidate
-
-    pol_matches = sorted(patch_dir.glob(f"patch_y{y}_x{x}_pol*.npy")) or sorted(
-        patch_dir.glob(f"patch_y{y}_x{x}_pol*.npz")
-    )
-    if len(pol_matches) == 1:
-        return pol_matches[0]
     return None
 
 
@@ -146,10 +135,9 @@ def _process_single_patch_worker(
     bbox_origin: Tuple[int, int],
     output_dir: Union[str, Path],
     polarization_channels: List[int],
-    normal_mode: str = "mean",
     formats: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Extract one patch at every requested polarization, plus its normal composite.
+    """Extract one patch at every requested polarization channel.
 
     Module-level by design: must stay picklable for
     ``multiprocessing.Pool``. Not part of the public API -- use
@@ -164,10 +152,12 @@ def _process_single_patch_worker(
     worker process re-executes this import on its own regardless.
 
     For each channel, saves whichever of ``formats`` were requested:
-    ``{base}_pol{c}.npy``/``.npz`` (raw array, native channel order) and/or
-    ``{base}_pol{c}.png``/``.jpg`` (RGB-converted). Then synthesizes and
-    saves the "normal" composite the same way as ``{base}_normal.*``,
-    where ``base = "patch_y{y_rel}_x{x_rel}"``.
+    ``{base}_pol{c}.npy``/``.npz`` (raw array, native channel order)
+    and/or ``{base}_pol{c}.png``/``.jpg`` (RGB-converted), where
+    ``base = "patch_y{y_rel}_x{x_rel}"``. No composite image is
+    synthesized or saved -- channel ``0`` is the slide's own
+    unpolarized/normal view and is used directly wherever a "normal"
+    image is needed (see :mod:`rockface.masks`).
 
     Never raises: any exception is caught and returned as an error
     dict, so one bad patch does not stop the whole
@@ -184,10 +174,8 @@ def _process_single_patch_worker(
             actually present in this CZI are dropped; if none of the
             requested channels are present, every available channel is
             used instead.
-        normal_mode: ``"mean"`` or ``"max"`` -- see
-            :func:`rockface.czi.synthesize_channel_stack`.
-        formats: Which file formats to save per channel/composite.
-            Any subset of ``{"npy", "npz", "png", "jpg"}``. Defaults to
+        formats: Which file formats to save per channel. Any subset of
+            ``{"npy", "npz", "png", "jpg"}``. Defaults to
             ``["npy", "png"]`` (the original codebase's behavior) when
             not given by the caller.
 
@@ -204,7 +192,6 @@ def _process_single_patch_worker(
         save_image_file,
         save_npy_array,
         save_npz_array,
-        synthesize_channel_stack,
     )
 
     active_formats = formats if formats is not None else _DEFAULT_PATCH_FORMATS
@@ -242,31 +229,11 @@ def _process_single_patch_worker(
         if not channels:
             channels = sorted(available)
 
-        polarized_stack = []
         for channel in channels:
             array = _read_channel_region(handle, region, channel)
-            polarized_stack.append(array)
             _save(array, f"{base}_pol{channel}")
 
-        # When only one channel was actually extracted, synthesizing a
-        # "normal" composite from it is a no-op: mean/max of a single
-        # array is that same array, so `_normal.*` would be a byte-for-byte
-        # duplicate of `_pol{channel}.*`. Skip writing it in that case --
-        # this is what previously made "normal" and "channel 0" look like
-        # "the same thing" when a slide/run only had channel 0 available
-        # (or `polarization_channels=[0]` was passed explicitly). Callers
-        # that read `_normal.*` (e.g. Mask.run(), Patching.restitch()) are
-        # documented to fall back to the single polarization channel.
-        normal_is_redundant = len(channels) == 1
-        if not normal_is_redundant:
-            normal = synthesize_channel_stack(polarized_stack, mode=normal_mode)
-            _save(normal, f"{base}_normal")
-
-        return {
-            "status": "ok",
-            "channels": channels,
-            "normal_is_redundant": normal_is_redundant,
-        }
+        return {"status": "ok", "channels": channels}
     except Exception as exc:  # noqa: BLE001 - deliberate: keep the Pool alive
         logger.error("Patch %s failed: %s", base, exc)
         return {"status": "error", "error": str(exc), "coord": coord}
@@ -377,7 +344,6 @@ class Patching:
         coord: Tuple[int, int],
         patch_size: int = 4096,
         polarization_channels: Optional[List[int]] = None,
-        normal_mode: str = "mean",
         output_dir: Optional[Union[str, Path]] = None,
         formats: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
@@ -392,8 +358,10 @@ class Patching:
                 mosaic bounding box.
             patch_size: Patch side length, in pixels.
             polarization_channels: Channel indices to extract. Defaults
-                to every channel available on the slide.
-            normal_mode: ``"mean"`` or ``"max"``.
+                to every channel available on the slide (typically
+                ``0`` through ``6``). Each is saved as its own raw
+                image -- channel ``0`` is the slide's unpolarized/
+                "normal" view; no composite is synthesized.
             output_dir: Directory to write into. Defaults to
                 ``CZI.output_dir / "patches"``.
             formats: Which file formats to save, any subset of
@@ -419,7 +387,6 @@ class Patching:
             bbox_origin=(bbox["x"], bbox["y"]),
             output_dir=target_dir,
             polarization_channels=channels,
-            normal_mode=normal_mode,
             formats=formats,
         )
 
@@ -429,7 +396,6 @@ class Patching:
         patch_size: int = 4096,
         stride: int = 3800,
         polarization_channels: Optional[List[int]] = None,
-        normal_mode: str = "mean",
         formats: Optional[List[str]] = None,
         max_workers: Optional[int] = None,
         on_progress: Optional[Callable[[str, float, str], None]] = None,
@@ -450,8 +416,11 @@ class Patching:
         rather than stopping the whole run.
 
         For every coordinate, extracts every requested polarization
-        channel and the synthesized normal composite, saving each to
-        ``CZI.output_dir / "patches"``.
+        channel as its own raw image, saving each to
+        ``CZI.output_dir / "patches"``. No composite "normal" image is
+        synthesized -- channel ``0`` is the slide's own
+        unpolarized/normal view (used directly by
+        :meth:`~rockface.masks.Mask.run`).
 
         Args:
             coords: Explicit ``(y, x)`` coordinates to process. If
@@ -464,13 +433,12 @@ class Patching:
                 list is given, but still worth passing consistently if
                 you plan to call :meth:`restitch` afterwards.
             polarization_channels: Channel indices to extract. Defaults
-                to every channel available on the slide. Channels not
-                actually present are dropped per-patch (see
+                to every channel available on the slide (typically
+                ``0`` through ``6``). Channels not actually present
+                are dropped per-patch (see
                 :func:`_process_single_patch_worker`).
-            normal_mode: ``"mean"`` or ``"max"``.
-            formats: Which file formats to save per channel and per
-                normal composite. Any subset of
-                ``{"npy", "npz", "png", "jpg"}``:
+            formats: Which file formats to save per channel. Any subset
+                of ``{"npy", "npz", "png", "jpg"}``:
 
                 - ``"npy"``/``"npz"`` -- raw array, native channel
                   order (lossless; what :meth:`restitch` and most
@@ -535,7 +503,6 @@ class Patching:
             bbox_origin=(bbox["x"], bbox["y"]),
             output_dir=output_dir,
             polarization_channels=channels,
-            normal_mode=normal_mode,
             formats=formats,
         )
 
@@ -571,6 +538,7 @@ class Patching:
         mask_dir: Union[str, Path],
         output_path: Union[str, Path],
         url_base: Optional[str] = None,
+        normal_channel: int = 0,
     ) -> int:
         """Write a manifest describing every extracted patch and its mask.
 
@@ -586,8 +554,11 @@ class Patching:
                 original ``http://localhost:8000/results/...``-style
                 manifest for a UI server). If ``None`` (default),
                 entries use plain relative filesystem paths
-                (``"patches/patch_y0_x0_normal.png"``), with no
+                (``"patches/patch_y0_x0_pol0.png"``), with no
                 assumption of any server being involved.
+            normal_channel: Which polarization channel is this slide's
+                unpolarized/normal view, used as each entry's primary
+                ``normal_url`` reference. Defaults to ``0``.
 
         Returns:
             The number of patch entries written.
@@ -599,7 +570,7 @@ class Patching:
             return f"{url_base}/{relative_path}" if url_base else relative_path
 
         entries = []
-        for normal_path in sorted(patch_dir.glob("*_normal.png")):
+        for normal_path in sorted(patch_dir.glob(f"*_pol{normal_channel}.png")):
             match = _PATCH_COORD_RE.search(normal_path.name)
             if not match:
                 continue
@@ -635,7 +606,7 @@ class Patching:
         self,
         patch_dir: Optional[Union[str, Path]] = None,
         stride: Optional[int] = None,
-        channel: str = "normal",
+        channel: str = "pol0",
     ) -> np.ndarray:
         """Reassemble extracted patches into a single full-resolution mosaic.
 
@@ -670,14 +641,9 @@ class Patching:
                 not inferred from the files themselves, since two
                 adjacent patch filenames alone don't disambiguate stride
                 from patch size.
-            channel: Which patch variant to restitch: ``"normal"``, or a
-                polarization channel name such as ``"pol0"``. When
-                ``channel="normal"``, any patch that has no ``_normal``
-                file because it was extracted with only one
-                polarization channel (see
-                :func:`_process_single_patch_worker`) contributes its
-                single ``_pol{c}`` file instead -- see
-                :func:`find_normal_source`.
+            channel: Which polarization channel to restitch, as a
+                ``"pol{c}"`` name, e.g. ``"pol0"`` (default -- the
+                slide's own unpolarized/normal view) or ``"pol3"``.
 
         Returns:
             A single array of shape ``(full_height_px, full_width_px)``
@@ -718,23 +684,6 @@ class Patching:
                 if match:
                     by_coord[(int(match.group(1)), int(match.group(2)))] = path
 
-        if channel == "normal":
-            # Patches extracted with only one polarization channel have
-            # no _normal file (see _process_single_patch_worker) -- fall
-            # back to that patch's single _pol{c} file, which represents
-            # the same thing the normal composite would have been.
-            pol_coord_re = re.compile(r"patch_y(\d+)_x(\d+)_pol\d+\.(npy|npz)$")
-            for path in patch_dir.glob("patch_y*_x*_pol*.npy"):
-                match = pol_coord_re.match(path.name)
-                if not match:
-                    continue
-                coord = (int(match.group(1)), int(match.group(2)))
-                if coord in by_coord:
-                    continue
-                fallback = find_normal_source(patch_dir, coord[0], coord[1])
-                if fallback is not None:
-                    by_coord[coord] = fallback
-
         if not by_coord:
             raise FileNotFoundError(
                 f"No 'patch_y{{y}}_x{{x}}_{channel}.npy' or '.npz' files found in "
@@ -762,6 +711,7 @@ class Patching:
         patch_dir: Optional[Union[str, Path]] = None,
         mask_dir: Optional[Union[str, Path]] = None,
         stride: Optional[int] = None,
+        source_channel: int = 0,
         color: Tuple[int, int, int] = (0, 255, 0),
         filled_mode: bool = True,
         thickness: int = 2,
@@ -769,8 +719,8 @@ class Patching:
         """Reassemble the full slide with its pore mask drawn on top.
 
         This is the "whole-slide reconstruction with the mask
-        reconstruction overlaid" variant: restitches the normal-image
-        mosaic (:meth:`restitch`, ``channel="normal"``) and the mask
+        reconstruction overlaid" variant: restitches the
+        ``source_channel`` mosaic (:meth:`restitch`) and the mask
         mosaic (from ``{base}_mask.npy``/``.npz`` files saved by
         :meth:`~rockface.masks.Mask.run`), then composites the mask on
         top as one combined RGB image. For a single patch instead of
@@ -779,7 +729,7 @@ class Patching:
 
         Args:
             patch_dir: Directory containing extracted patch files
-                (``patch_y{y}_x{x}_normal.npy`` etc). Defaults to
+                (``patch_y{y}_x{x}_pol{c}.npy`` etc). Defaults to
                 ``CZI.output_dir / "patches"``.
             mask_dir: Directory containing mask files
                 (``patch_y{y}_x{x}_mask.npy``/``.npz``, as saved by
@@ -787,6 +737,12 @@ class Patching:
                 included). Defaults to ``CZI.output_dir / "masks"``.
             stride: The stride used during patch extraction. Required,
                 same as :meth:`restitch`.
+            source_channel: Which polarization channel to restitch as
+                the base image the mask is drawn on. Defaults to
+                ``0``, the slide's own unpolarized/normal view --
+                match this to whatever channel :meth:`~rockface.masks.Mask.run`
+                used to generate the masks being overlaid (also ``0``
+                by default).
             color: Overlay color for the pore mask.
             filled_mode: If ``True`` (default here -- unlike
                 :meth:`~rockface.masks.Mask.generate_transparent_overlay`'s
@@ -798,22 +754,22 @@ class Patching:
 
         Returns:
             An RGB ``uint8`` array (``full_height_px``,
-            ``full_width_px``, 3): the restitched normal mosaic with
-            the restitched pore mask drawn on top.
+            ``full_width_px``, 3): the restitched ``source_channel``
+            mosaic with the restitched pore mask drawn on top.
 
         Raises:
             ValueError: If ``stride`` is not given.
-            FileNotFoundError: If no normal-image or no mask files are
-                found to restitch (see :meth:`restitch`'s ``Raises``
-                for the normal-image case; the mask case requires
-                ``Mask.run(formats=[...])`` to have included ``"npy"``
-                or ``"npz"``, not just ``"png"``/``"jpg"``).
+            FileNotFoundError: If no source-channel or no mask files
+                are found to restitch (see :meth:`restitch`'s
+                ``Raises`` for the source-channel case; the mask case
+                requires ``Mask.run(formats=[...])`` to have included
+                ``"npy"`` or ``"npz"``, not just ``"png"``/``"jpg"``).
 
         Warning:
             Same memory caveat as :meth:`restitch`: full-resolution
             mosaics for large slides can occupy multiple gigabytes of
-            RAM -- here, twice over (normal mosaic + mask mosaic) plus
-            the composited result.
+            RAM -- here, twice over (source-channel mosaic + mask
+            mosaic) plus the composited result.
         """
         from .czi import convert_array_to_rgb
         from .masks import composite_overlay_on_image, generate_transparent_overlay_array
@@ -823,7 +779,7 @@ class Patching:
 
         mask_dir = Path(mask_dir) if mask_dir is not None else self._czi.output_dir / "masks"
 
-        normal_mosaic = self.restitch(patch_dir=patch_dir, stride=stride, channel="normal")
+        base_mosaic = self.restitch(patch_dir=patch_dir, stride=stride, channel=f"pol{source_channel}")
 
         # Mask files are named "{base}_mask.*", not "{base}_{channel}.*"
         # like patches -- restitch() can't be reused directly for them,
@@ -855,7 +811,7 @@ class Patching:
             mask_canvas[y:y + eff_h, x:x + eff_w] = array[:eff_h, :eff_w]
 
         pixel_format = self._czi._pixel_format()
-        base_rgb = convert_array_to_rgb(normal_mosaic, pixel_format=pixel_format)
+        base_rgb = convert_array_to_rgb(base_mosaic, pixel_format=pixel_format)
         overlay = generate_transparent_overlay_array(
             mask_canvas, color=color, filled_mode=filled_mode, thickness=thickness
         )
